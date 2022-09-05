@@ -17,15 +17,21 @@
  */
 
 #include "micro-ecc-master/uECC.h"
-#include "zlib.h"
+#include "zlib/zlib.h"
 #include "zstd/lib/zstd.h"
-#include <dirent.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#ifdef _WINDOWS
+#include "dirent.h"
+#else
+#include <dirent.h>
 #include <unistd.h>
+#endif // _WINDOWS
 
 typedef enum { false, true } bool;
 
@@ -49,14 +55,59 @@ const int MAGIC_ASYNC_NO_CRYPT_ZSTD_START = 0x0D;
 const int MAGIC_END = 0x00;
 const int BASE_KEY = 0xCC;
 
-int lastseq = 0;
+static int lastseq = 0;
 
 const char *PRIV_KEY = "";
 const char *PUB_KEY = "";
 
 const int TEA_BLOCK_LEN = 8;
 
-bool Hex2Buffer(const char *str, size_t len, unsigned char *buffer) {
+static const int kReusebaleZStd = 0;
+static const int kReusebaleZLib = 1;
+static const int kReusebaleDecodeBuffer = 2;
+static void *reusable_ptr[3] = {NULL};
+static size_t reusable_size[3] = {0};
+
+static void *allocReusable(const int index, const size_t size) {
+  if (size > reusable_size[index]) {
+    void *ptr = malloc(size);
+    if (ptr == NULL) {
+      fputs("Memory error", stderr);
+      exit(3);
+    }
+    if (reusable_ptr[index] != NULL) {
+      free(reusable_ptr[index]);
+    }
+    reusable_ptr[index] = ptr;
+    reusable_size[index] = size;
+    return ptr;
+  }
+  return reusable_ptr[index];
+}
+
+static void *reallocReusable(const int index, const size_t size) {
+  if (size > reusable_size[index]) {
+    void *ptr = realloc(reusable_ptr[index], size);
+    if (ptr == NULL) {
+      fputs("Memory error", stderr);
+      exit(3);
+    }
+    reusable_ptr[index] = ptr;
+    reusable_size[index] = size;
+    return ptr;
+  }
+  return reusable_ptr[index];
+}
+
+static void freeReusable(const int index) {
+  if (reusable_ptr[index] != NULL) {
+    free(reusable_ptr[index]);
+    reusable_ptr[index] = NULL;
+    reusable_size[index] = 0;
+  }
+}
+
+static bool hex2Buffer(const char *str, size_t len, unsigned char *buffer) {
   if (NULL == str || len == 0 || len % 2 != 0) {
     return -1;
   }
@@ -79,7 +130,7 @@ bool Hex2Buffer(const char *str, size_t len, unsigned char *buffer) {
   return true;
 }
 
-void teaDecrypt(uint32_t *v, uint32_t *k) {
+static void teaDecrypt(uint32_t *v, uint32_t *k) {
   uint32_t v0 = v[0], v1 = v[1], sum, i;
   const static uint32_t delta = 0x9e3779b9;
   const static uint32_t totalSum = 0x9e3779b9 << 4;
@@ -95,8 +146,8 @@ void teaDecrypt(uint32_t *v, uint32_t *k) {
   v[1] = v1;
 }
 
-bool isGoodLogBuffer(const char *buffer, size_t bufferSize, size_t offset,
-                     int count) {
+static bool isGoodLogBuffer(const char *buffer, size_t bufferSize,
+                            size_t offset, int count) {
   if (offset == bufferSize) {
     return true;
   }
@@ -150,29 +201,25 @@ bool isGoodLogBuffer(const char *buffer, size_t bufferSize, size_t offset,
     return isGoodLogBuffer(buffer, bufferSize, offset + headerLen + length + 1,
                            count - 1);
   }
-
-  return true;
 }
 
-size_t getLogStartPos(const char *buffer, size_t bufferSize, int count) {
+static size_t getLogStartPos(const char *buffer, size_t bufferSize, int count) {
   size_t offset = 0;
-  while (1) {
-    if (offset >= bufferSize) {
-      break;
-    }
+  while (offset < bufferSize) {
     if (buffer[offset] >= MAGIC_CRYPT_START &&
         buffer[offset] <= MAGIC_ASYNC_NO_CRYPT_ZSTD_START) {
       if (isGoodLogBuffer(buffer, bufferSize, offset, count)) {
         return offset;
       }
     }
-    offset += 1;
+    ++offset;
   }
   return -1;
 }
 
-void appendBuffer(char **outBuffer, size_t *outBufferSize, size_t *writePos,
-                  const char *buffer, size_t bufferSize) {
+static void appendBuffer(char **outBuffer, size_t *outBufferSize,
+                         size_t *writePos, const char *buffer,
+                         size_t bufferSize) {
   if ((*outBufferSize) - (*writePos) < bufferSize + 1) // + 1 for last \0
   {
     char *newOutBuffer =
@@ -191,19 +238,42 @@ void appendBuffer(char **outBuffer, size_t *outBufferSize, size_t *writePos,
   *writePos = (*writePos) + bufferSize;
 }
 
-bool zstdDecompress(const char *compressedBytes, size_t compressedBytesSize,
-                    char **outBuffer, size_t *outBufferSize) {
+static void appendFile(FILE *outFile, char **outBuffer, size_t *outBufferSize,
+                       size_t *writePos, const char *buffer,
+                       size_t bufferSize) {
+  if ((*outBufferSize) - (*writePos) < bufferSize + 1) // + 1 for last \0
+  {
+    fwrite(*outBuffer, sizeof(char), *writePos, outFile);
+    *writePos = 0;
+    if ((*outBufferSize) < bufferSize + 1) // + 1 for last \0
+    {
+      free(*outBuffer);
+      *outBufferSize = 2 * bufferSize + 1;
+      *outBuffer = (char *)malloc(*outBufferSize);
+      if (*outBuffer == NULL) {
+        fclose(outFile);
+        fputs("Error reallocating memory", stderr);
+        exit(5);
+      }
+    }
+  }
+
+  memcpy(*outBuffer + (*writePos), buffer, bufferSize);
+  *writePos = (*writePos) + bufferSize;
+}
+
+static bool zstdDecompress(const char *compressedBytes,
+                           size_t compressedBytesSize, char **outBuffer,
+                           size_t *outBufferSize) {
   *outBuffer = NULL;
   *outBufferSize = 0;
   if (compressedBytesSize == 0) {
     return true;
   }
 
-  unsigned fullLength = compressedBytesSize;
-  unsigned halfLength = compressedBytesSize / 2;
-
-  unsigned uncompLength = fullLength;
-  char *uncomp = (char *)calloc(sizeof(char), uncompLength);
+  const size_t halfLength = compressedBytesSize; // / 2
+  size_t uncompLength = compressedBytesSize;
+  char *uncomp = (char *)allocReusable(kReusebaleZStd, uncompLength);
 
   ZSTD_DCtx *const dctx = ZSTD_createDCtx();
 
@@ -213,10 +283,12 @@ bool zstdDecompress(const char *compressedBytes, size_t compressedBytesSize,
 
   while (!done) {
     if (output.pos >= uncompLength) {
-      char *uncomp2 = (char *)calloc(sizeof(char), uncompLength + halfLength);
-      memcpy(uncomp2, uncomp, uncompLength);
-      uncompLength += halfLength;
-      free(uncomp);
+      char *uncomp2 =
+          (char *)reallocReusable(kReusebaleZStd, uncompLength += halfLength);
+      if (uncomp2 == NULL) {
+        fputs("Memory error", stderr);
+        exit(3);
+      }
       uncomp = uncomp2;
     }
 
@@ -236,8 +308,9 @@ bool zstdDecompress(const char *compressedBytes, size_t compressedBytesSize,
   return true;
 }
 
-bool zlibDecompress(const char *compressedBytes, size_t compressedBytesSize,
-                    char **outBuffer, size_t *outBufferSize) {
+static bool zlibDecompress(const char *compressedBytes,
+                           size_t compressedBytesSize, char **outBuffer,
+                           size_t *outBufferSize) {
 
   *outBuffer = NULL;
   *outBufferSize = 0;
@@ -245,11 +318,9 @@ bool zlibDecompress(const char *compressedBytes, size_t compressedBytesSize,
     return true;
   }
 
-  unsigned fullLength = compressedBytesSize;
-  unsigned halfLength = compressedBytesSize / 2;
-
-  unsigned uncompLength = fullLength;
-  char *uncomp = (char *)calloc(sizeof(char), uncompLength);
+  const size_t halfLength = compressedBytesSize; // / 2
+  size_t uncompLength = compressedBytesSize;
+  char *uncomp = (char *)allocReusable(kReusebaleZLib, uncompLength);
 
   z_stream strm;
   strm.next_in = (Bytef *)compressedBytes;
@@ -261,7 +332,7 @@ bool zlibDecompress(const char *compressedBytes, size_t compressedBytesSize,
   bool done = false;
 
   if (inflateInit2(&strm, (-MAX_WBITS)) != Z_OK) {
-    free(uncomp);
+    // free(uncomp);
     return false;
   }
 
@@ -269,10 +340,12 @@ bool zlibDecompress(const char *compressedBytes, size_t compressedBytesSize,
     // If our output buffer is too small
     if (strm.total_out >= uncompLength) {
       // Increase size of output buffer
-      char *uncomp2 = (char *)calloc(sizeof(char), uncompLength + halfLength);
-      memcpy(uncomp2, uncomp, uncompLength);
-      uncompLength += halfLength;
-      free(uncomp);
+      char *uncomp2 =
+          (char *)reallocReusable(kReusebaleZLib, uncompLength += halfLength);
+      if (uncomp2 == NULL) {
+        fputs("Memory error", stderr);
+        exit(3);
+      }
       uncomp = uncomp2;
     }
 
@@ -289,7 +362,7 @@ bool zlibDecompress(const char *compressedBytes, size_t compressedBytesSize,
   }
 
   if (inflateEnd(&strm) != Z_OK) {
-    free(uncomp);
+    // free(uncomp);
     return false;
   }
 
@@ -298,8 +371,9 @@ bool zlibDecompress(const char *compressedBytes, size_t compressedBytesSize,
   return true;
 }
 
-int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
-                 char **outBuffer, size_t *outBufferSize, size_t *writePos) {
+static int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
+                        char **outBuffer, size_t *outBufferSize,
+                        size_t *writePos, FILE *outFile) {
   if (offset >= bufferSize) {
     return -1;
   }
@@ -312,7 +386,8 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
       char text[128];
       snprintf(text, sizeof(text),
                "[F]decode_log_file.py decode error len=%d\n", (int)fixpos);
-      appendBuffer(outBuffer, outBufferSize, writePos, text, strlen(text));
+      appendFile(outFile, outBuffer, outBufferSize, writePos, text,
+                 strlen(text));
       offset += fixpos;
     }
   }
@@ -339,9 +414,9 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
   } else {
     char text[128];
     snprintf(text, sizeof(text),
-             "in DecodeBuffer _buffer[%zu]:%d != MAGIC_NUM_START", offset,
+             "in DecodeBuffer _buffer[%zu]:%d != MAGIC_NUM_START\n", offset,
              (int)buffer[offset]);
-    appendBuffer(outBuffer, outBufferSize, writePos, text, strlen(text));
+    appendFile(outFile, outBuffer, outBufferSize, writePos, text, strlen(text));
     return -1;
   }
 
@@ -369,7 +444,8 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
       snprintf(text, sizeof(text),
                "[F]decode_log_file.py log seq:%d-%d is missing\n", lastseq + 1,
                seq - 1);
-      appendBuffer(outBuffer, outBufferSize, writePos, text, strlen(text));
+      appendFile(outFile, outBuffer, outBufferSize, writePos, text,
+                 strlen(text));
     }
 
     if (seq != 0) {
@@ -377,7 +453,7 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
     }
   }
 
-  char *tmpBuffer = (char *)realloc(NULL, length);
+  char *tmpBuffer = (char *)allocReusable(kReusebaleDecodeBuffer, length);
   size_t tmpBufferSize = length;
   if (tmpBuffer == NULL) {
     fputs("Memory error", stderr);
@@ -398,7 +474,7 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
       exit(6);
     }
 
-    free(tmpBuffer);
+    // free(tmpBuffer);
     tmpBuffer = decompBuffer;
     tmpBufferSize = decompBufferSize;
   } else if (NEW_MAGIC_COMPRESS_CRYPT_START1 == buffer[offset]) {
@@ -427,7 +503,7 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
       exit(6);
     }
 
-    free(tmpBuffer);
+    // free(tmpBuffer);
     tmpBuffer = decompBuffer;
     tmpBufferSize = decompBufferSize;
   } else if (MAGIC_SYNC_ZLIB_START == buffer[offset] ||
@@ -438,12 +514,12 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
   } else if (MAGIC_ASYNC_ZLIB_START == buffer[offset] ||
              MAGIC_ASYNC_ZSTD_START == buffer[offset]) {
     memcpy(tmpBuffer, buffer + offset + headerLen, length);
-    unsigned char clientPubKey[cryptKeyLen];
+    unsigned char *clientPubKey = (unsigned char *)alloca(cryptKeyLen);
     memcpy(clientPubKey, buffer + offset + headerLen - cryptKeyLen,
            cryptKeyLen);
 
     unsigned char svrPriKey[32] = {0};
-    if (!Hex2Buffer(PRIV_KEY, 64, svrPriKey)) {
+    if (!hex2Buffer(PRIV_KEY, 64, svrPriKey)) {
       fputs("Get PRIV KEY error", stderr);
       exit(7);
     }
@@ -483,7 +559,7 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
       }
     }
 
-    free(tmpBuffer);
+    // free(tmpBuffer);
     tmpBuffer = decompBuffer;
     tmpBufferSize = decompBufferSize;
   } else if (MAGIC_ASYNC_NO_CRYPT_ZLIB_START == buffer[offset] ||
@@ -505,7 +581,7 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
       }
     }
 
-    free(tmpBuffer);
+    // free(tmpBuffer);
     tmpBuffer = decompBuffer;
     tmpBufferSize = decompBufferSize;
   } else {
@@ -515,35 +591,31 @@ int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
     }
   }
 
-  appendBuffer(outBuffer, outBufferSize, writePos, tmpBuffer, tmpBufferSize);
-  free(tmpBuffer);
+  appendFile(outFile, outBuffer, outBufferSize, writePos, tmpBuffer,
+             tmpBufferSize);
+  // free(tmpBuffer);
 
   return offset + headerLen + length + 1;
 }
 
-void parseFile(const char *path, const char *outPath) {
-  FILE *file;
-  size_t bufferSize;
-  char *buffer;
-  size_t result;
-
-  file = fopen(path, "rb");
+static void parseFile(const char *path, const char *outPath) {
+  FILE *file = fopen(path, "rb");
   if (file == NULL) {
     fputs("File error", stderr);
     exit(1);
   }
 
   fseek(file, 0, SEEK_END);
-  bufferSize = (size_t)ftell(file);
+  size_t bufferSize = (size_t)ftell(file);
   rewind(file);
 
-  buffer = (char *)malloc(sizeof(char) * bufferSize);
+  char *buffer = (char *)malloc(sizeof(char) * bufferSize);
   if (buffer == NULL) {
     fputs("Memory error", stderr);
     exit(2);
   }
 
-  result = fread(buffer, 1, bufferSize, file);
+  size_t result = fread(buffer, 1, bufferSize, file);
   if (result != bufferSize) {
     fputs("Reading error", stderr);
     exit(3);
@@ -557,25 +629,26 @@ void parseFile(const char *path, const char *outPath) {
   }
 
   size_t outBufferSize = bufferSize * 6;
-  char *outBuffer = (char *)realloc(NULL, outBufferSize);
+  char *outBuffer = (char *)malloc(outBufferSize);
   size_t writePos = 0;
-  while (1) {
-    startPos = decodeBuffer(buffer, bufferSize, startPos, &outBuffer,
-                            &outBufferSize, &writePos);
-    if (-1 == startPos) {
-      break;
-    }
-  }
-
   FILE *outFile = fopen(outPath, "wb");
+  do {
+    startPos = decodeBuffer(buffer, bufferSize, startPos, &outBuffer,
+                            &outBufferSize, &writePos, outFile);
+  } while (-1 != startPos);
+
   outBuffer[writePos] = '\0';
   fwrite(outBuffer, sizeof(char), writePos, outFile);
   fclose(outFile);
   free(buffer);
   free(outBuffer);
+
+  freeReusable(kReusebaleZStd);
+  freeReusable(kReusebaleZLib);
+  freeReusable(kReusebaleDecodeBuffer);
 }
 
-void parseDir(const char *path) {
+static void parseDir(const char *path) {
   DIR *dir;
   struct dirent *ent;
   if ((dir = opendir(path)) != NULL) {
@@ -598,7 +671,6 @@ void parseDir(const char *path) {
 }
 
 int main(int argc, char *argv[]) {
-
   if (argc == 2) {
     char *path = argv[1];
     struct stat path_stat;
