@@ -632,6 +632,7 @@ static void parseFile(const char *path, const char *outPath) {
   char *outBuffer = (char *)malloc(outBufferSize);
   size_t writePos = 0;
   FILE *outFile = fopen(outPath, "wb");
+  fwrite("\xEF\xBB\xBF", sizeof(char), 3, outFile);
   do {
     startPos = decodeBuffer(buffer, bufferSize, startPos, &outBuffer,
                             &outBufferSize, &writePos, outFile);
