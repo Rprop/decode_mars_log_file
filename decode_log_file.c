@@ -656,10 +656,15 @@ static void parseDir(const char *path) {
     while ((ent = readdir(dir)) != NULL) {
       if (strlen(ent->d_name) > 5 &&
           strcmp(ent->d_name + strlen(ent->d_name) - 5, ".xlog") == 0) {
-        char inPath[260] = {0};
-        char outPath[260] = {0};
-        snprintf(inPath, sizeof(inPath), "%s/%s", path, ent->d_name);
-        snprintf(outPath, sizeof(outPath), "%s/%s.log", path, ent->d_name);
+        char inPath[PATH_MAX] = {0};
+        const int n =
+            snprintf(inPath, sizeof(inPath), "%s/%s", path, ent->d_name);
+        if ((n + 4) >= PATH_MAX) {
+          fputs("path too long", stderr);
+          exit(1);
+        }
+        char outPath[PATH_MAX] = {0};
+        snprintf(outPath, sizeof(outPath), "%s.log", inPath);
         lastseq = 0;
         parseFile(inPath, outPath);
       }
@@ -678,7 +683,7 @@ int main(int argc, char *argv[]) {
     stat(path, &path_stat);
 
     if (S_ISREG(path_stat.st_mode)) {
-      char outPath[260] = {0};
+      char outPath[PATH_MAX] = {0};
       snprintf(outPath, sizeof(outPath), "%s.log", path);
       parseFile(path, outPath);
     } else if (S_ISDIR(path_stat.st_mode)) {
