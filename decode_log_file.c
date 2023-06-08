@@ -280,6 +280,7 @@ static bool zstdDecompress(const char *compressedBytes,
   ZSTD_inBuffer input = {compressedBytes, compressedBytesSize, 0};
   ZSTD_outBuffer output = {NULL, compressedBytesSize, 0};
   bool done = false;
+  size_t lastPos = output.pos;
 
   while (!done) {
     if (output.pos >= uncompLength) {
@@ -294,9 +295,21 @@ static bool zstdDecompress(const char *compressedBytes,
 
     output.size = uncompLength;
     output.dst = uncomp;
-    ZSTD_decompressStream(dctx, &output, &input);
+    size_t decompressResult = ZSTD_decompressStream(dctx, &output, &input);
+    if (lastPos == output.pos) {
+      fputs("ZSTD_decompressStream error", stderr);
+      done = true;
+    }
 
+    lastPos = output.pos;
     if (input.pos == input.size) {
+      done = true;
+    }
+
+    if (input.pos == 0) {
+      const char *const err = "zstd decompress error";
+      output.pos = strnlen(err, 1024);
+      memcpy(uncomp, err, output.pos);
       done = true;
     }
   }
@@ -337,6 +350,21 @@ static bool zlibDecompress(const char *compressedBytes,
   }
 
   while (!done) {
+    strm.next_out = (Bytef *)(uncomp + strm.total_out);
+    strm.avail_out = uncompLength - strm.total_out;
+
+    // Inflate another chunk.
+    int err = inflate(&strm, Z_SYNC_FLUSH);
+    // decompress success
+    if (strm.total_in == compressedBytesSize) {
+      break;
+    }
+    if (err == Z_STREAM_END || err == Z_BUF_ERROR || err == Z_DATA_ERROR) {
+      done = true;
+    } /* else if (err != Z_OK) {
+      break;
+    } */
+
     // If our output buffer is too small
     if (strm.total_out >= uncompLength) {
       // Increase size of output buffer
@@ -347,17 +375,6 @@ static bool zlibDecompress(const char *compressedBytes,
         exit(3);
       }
       uncomp = uncomp2;
-    }
-
-    strm.next_out = (Bytef *)(uncomp + strm.total_out);
-    strm.avail_out = uncompLength - strm.total_out;
-
-    // Inflate another chunk.
-    int err = inflate(&strm, Z_SYNC_FLUSH);
-    if (err == Z_STREAM_END) {
-      done = true;
-    } else if (err != Z_OK) {
-      break;
     }
   }
 
@@ -454,6 +471,7 @@ static int decodeBuffer(const char *buffer, size_t bufferSize, size_t offset,
   }
 
   char *tmpBuffer = (char *)allocReusable(kReusebaleDecodeBuffer, length);
+  memset(tmpBuffer, 0, length);
   size_t tmpBufferSize = length;
   if (tmpBuffer == NULL) {
     fputs("Memory error", stderr);
